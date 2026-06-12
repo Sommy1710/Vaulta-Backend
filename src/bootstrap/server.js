@@ -9,9 +9,11 @@ import {getSecondsFromNow} from '../lib/util.js';
 import express from 'express';
 import {createServer} from 'http';
 import {authRouter} from '../modules/auth/api.js';
+import {singleSavingsRouter} from '../modules/singleSavings/singleSavingsRoutes.js';
 import cookieParser  from 'cookie-parser';
 import swaggerUi from 'swagger-ui-express';
 import swaggerSpec from '../docs/swagger.js';
+import '../lib/cronJobs.js';
 
 const app = express();
 const server = createServer(app);
@@ -38,6 +40,7 @@ app.get('/health', (req, res) => {
     });
 })
 app.use('/api/auth', authRouter);
+app.use('/api/singleSavings', singleSavingsRouter);
 
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
