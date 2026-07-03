@@ -1,3 +1,4 @@
+import {prisma} from "../../config/db.prisma.js";
 import {asyncHandler} from '../../lib/util.js';
 import argon from 'argon2';
 import * as authService from './auth.service.js';
@@ -5,11 +6,14 @@ import {Validator} from '../../lib/validator.js';
 import {CreateUserRequest, UpdateUserRequest, ChangeUserPasswordRequest} from './create-user.request.js';
 import { AuthUserRequest, } from './auth-user.request.js';
 import { ValidationError } from '../../lib/error-definitions.js';
-import {User} from './user.schema.js';
+//import {User} from './user.schema.js';
 import {sendEmail} from '../../lib/emailService.js';
 import { deleteUserById } from './user.service.js';
+import * as userService from './user.service.js';
 import config from '../../config/app.config.js';
 import { UnauthorizedError, NotFoundError, UnauthenticatedError } from '../../lib/error-definitions.js';
+import {io} from "../../bootstrap/server.js";
+
 
 //function to generate a 4-digit OTP
 
@@ -72,7 +76,7 @@ export const verifyEmailOTP = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Email and OTP are required.' });
   }
 
-  const user = await User.findOne({ email });
+  const user = await userService.getUserByEmail(email);
   if (!user) {
     return res.status(404).json({ message: 'User not found.' });
   }
@@ -86,11 +90,16 @@ export const verifyEmailOTP = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Invalid or expired OTP.' });
   }
 
-  user.isEmailVerified = true;
-  user.emailVerificationCode = null;
-  user.emailCodeExpiry = null;
-
-  await user.save();
+  await prisma.user.update({
+  where: {
+    id: user.id
+  },
+  data: {
+    isEmailVerified: true,
+    emailVerificationCode: null,
+    emailCodeExpiry: null
+  }
+});
 
   return res.status(200).json({ message: 'Email verified successfully.' });
 });
@@ -100,7 +109,7 @@ export const authenticateUser = asyncHandler(async(req, res) => {
   const {value, errors} = validator.validate(AuthUserRequest, req.body);
   if (errors) throw new ValidationError('the request failed with the following errors', errors);
 
-  const user = await User.findOne({email: value.email});
+  const user = await userService.getUserByEmail(value.email);
   if (!user) {
     return res.status(404).json({message: 'User not found'});
   }
@@ -109,9 +118,18 @@ export const authenticateUser = asyncHandler(async(req, res) => {
     const otpCode = generateOTP();
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); //10 minutes
 
-    user.emailVerificationCode = otpCode;
-    user.emailCodeExpiry = otpExpiry;
-    await user.save();
+
+    await prisma.user.update({
+      where: {
+        id: user.id
+      },
+      data: {
+        emailVerificationCode: otpCode,
+        emailCodeExpiry: otpExpiry
+      }
+    })
+
+   
 
     try {
       await sendEmail({
@@ -163,42 +181,59 @@ export const logoutUser = asyncHandler(async (req, res) => {
   return res.status(200).json({ success: true, message: 'User successfully logged out' });
 });
 
-export const updateUserAccount = asyncHandler(async (req, res) => {
-  const { userId } = req.params;
+export const updateUserAccount =asyncHandler(async(req, res) => {
+  const {userId} = req.params;
   const requester = req.user;
 
-  const isAdmin = ['admin'].includes(requester.role);
+  const isAdmin = requester.role === "ADMIN";
   const isSelf = requester.id === userId;
 
   if (!isAdmin && !isSelf) {
-    throw new UnauthorizedError("You are not authorized to update this account");
+    throw new UnauthorizedError(
+      "you are not authorized to update this account"
+    );
   }
-
   const validator = new Validator();
-  const { value, errors } = validator.validate(UpdateUserRequest, req.body);
+  const {value, errors} = validator.validate(
+    UpdateUserRequest,
+    req.body
+  );
 
   if (errors) {
-    throw new ValidationError('The request failed with the following errors', errors);
+    throw new ValidationError(
+      "the request failed with the following errors",
+      errors
+    );
   }
-
-  const user = await User.findById(userId);
+  const user = await prisma.user.findUnique({
+    where: {
+      id: userId,
+    },
+  });
   if (!user) {
-    return res.status(404).json({ message: "User not found." });
+    return res.status(404).json({
+      success: false,
+      message: "User not found",
+    });
   }
 
-  // Update allowed fields
-  Object.assign(user, value);
-
-  await user.save();
+  const updatedUser = await prisma.user.update({
+    where: {
+      id: userId,
+    },
+    data: value,
+  });
 
   return res.status(200).json({
     success: true,
     message: "User updated successfully",
     data: {
-      user
-    }
+      user: updatedUser,
+    },
   });
 });
+
+
 
 export const forgotPassword = asyncHandler(async (req, res) => {
   const { email } = req.body;
@@ -207,7 +242,7 @@ export const forgotPassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Email is required.' });
   }
 
-  const user = await User.findOne({ email });
+  const user = await userService.getUserByEmail(email);
   if (!user) {
     return res.status(404).json({ message: 'User not found.' });
   }
@@ -215,9 +250,15 @@ export const forgotPassword = asyncHandler(async (req, res) => {
   const otpCode = generateOTP();
   const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-  user.passwordResetCode = otpCode;
-  user.passwordResetExpiry = otpExpiry;
-  await user.save();
+  await prisma.user.update({
+  where: {
+    id: user.id
+  },
+  data: {
+    passwordResetCode: otpCode,
+    passwordResetExpiry: otpExpiry
+  }
+});
 
   try {
     await sendEmail({
@@ -250,7 +291,7 @@ export const resetPassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Email, OTP, and new password are required.' });
   }
 
-  const user = await User.findOne({ email });
+  const user = await userService.getUserByEmail(email);
   if (!user) {
     return res.status(404).json({ message: 'User not found.' });
   }
@@ -264,11 +305,19 @@ export const resetPassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Invalid or expired OTP.' });
   }
 
-  user.password = newPassword;
-  user.passwordResetCode = null;
-  user.passwordResetExpiry = null;
+  const hashedPassword = await argon.hash(newPassword);
 
-  await user.save();
+  await prisma.user.update({
+    where: {
+      id: user.id
+    },
+    data: {
+      password: hashedPassword,
+      passwordResetCode: null,
+      passwordResetExpiry: null
+    }
+  });
+
 
   return res.status(200).json({ message: 'Password reset successfully.' });
 });
@@ -278,7 +327,7 @@ export const deleteUserAccount = asyncHandler(async (req, res) => {
   const requester = req.user;
 
   // Allow if requester is admin
-  const isAdmin = ['admin'].includes(requester.role);
+  const isAdmin = requester.role === "ADMIN";
 
   //  Allow if requester is deleting their own account
   const isSelf = requester.id === userId;
@@ -295,3 +344,50 @@ export const deleteUserAccount = asyncHandler(async (req, res) => {
   });
 });
 
+export const reportProblem = asyncHandler(async (req, res) => {
+  const userId = req.user?.id;
+
+  const {
+    category,
+    subject,
+    description,
+  } = req.body;
+
+  if (!category || !subject || !description) {
+    return res.status(400).json({
+      success: false,
+      message: "Category, subject and description are required.",
+    });
+  }
+
+  const report = await prisma.report.create({
+    data: {
+      userId,
+      category,
+      subject,
+      description,
+    },
+  });
+
+  return res.status(201).json({
+    success: true,
+    message: "Problem reported successfully.",
+    data: report,
+  });
+});
+
+export const getMyReports = asyncHandler(async (req, res) => {
+  const reports = await prisma.report.findMany({
+    where: {
+      userId: req.user.id,
+    },
+    orderBy: {
+      createdAt: "desc",
+    },
+  });
+
+  res.status(200).json({
+    success: true,
+    data: reports,
+  });
+});

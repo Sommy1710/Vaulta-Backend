@@ -1,7 +1,8 @@
+import {prisma} from "../../config/db.prisma.js";
 import { asyncHandler } from "../../lib/util.js";
 import * as singleSavingsService from "./singleSavingsService.js";
-import { SingleSavings } from "./singleSavingsSchema.js";
-import { SingleSavingsWithdrawal } from "./singleSavingsSchema.js";
+import { redisClient } from "../../config/redis.config.js";
+
 
 
 export const createSingleSavingsPlan = asyncHandler(async (req, res) => {
@@ -38,59 +39,92 @@ export const createSingleSavingsPlan = asyncHandler(async (req, res) => {
             Number(amount)
         );
 
+    //invalidate the cached savings history
+    await redisClient.del(`singleSavings:${userId}`);
+
     res.status(201).json({
         success: true,
-        message: "Single savings plan created successfully",
-        data: savingsPlan,
+        message: "Single savings plan created successfully. Please make payment with any of the following payment methods to activate your savings plan.",
+        data: {
+            savingsPlan,
+            paymentDetails: {
+                bankTransfer: {
+                    status: "UNAVAILABLE",
+                    message:
+                    "Bank payment currently unavailable, please try a different payment method."
+                },
+                bitcoin: {
+            network: "Bitcoin",
+            address:
+            "bc1qs9q7ynsldjwn62rtjha3q29v54ewqef08fxrdp",
+            amountToPay: amount,
+          },
+
+          ethereum: {
+            network: "Ethereum",
+            address:
+            "0xFCa95a8187e9BEd54df102C111CedaF93f596F2D",
+            amountToPay: amount,
+          },
+            }
+
+        }
+        
     });
 });
 
 
-/*export const getTotalYield = asyncHandler(async (req, res) => {
-    const { planId } = req.params;
 
-    const payout = await singleSavingsService.getSavingsPayout(planId);
-
-    res.status(200).json({
-        success: true,
-        data: payout,
-    });
-});*/
 
 export const getTotalYield = asyncHandler(async (req, res) => {
     const { planId } = req.params;
 
     const userId = req.user?.id || req.user?._id;
 
-    const plan = await SingleSavings.findOne({
-        _id: planId,
-        user: userId,
+    let plan = await prisma.singleSavings.findFirst({
+        where: {
+            id: planId,
+            userId,
+        },
     });
 
     if (!plan) {
         return res.status(404).json({
             success: false,
-            message: "Plan not found or you are not authorized to access it",
+            message:
+                "Plan not found or you are not authorized to access it",
         });
     }
 
     const now = new Date();
 
     // If maturity date has passed, update status and payout
-    if (plan.status === "active" && now >= plan.maturityDate) {
-        plan.status = "matured";
-        plan.expectedInterest =
+    if (
+        plan.status === "ACTIVE" &&
+        now >= plan.maturityDate
+    ) {
+        const expectedInterest =
             (plan.amountSaved * plan.interestRate) / 100;
 
-        plan.totalPayout =
-            plan.amountSaved + plan.expectedInterest;
+        const totalPayout =
+            plan.amountSaved + expectedInterest;
 
-        plan.lastCompoundedAt = plan.maturityDate;
-
-        await plan.save();
+        plan = await prisma.singleSavings.update({
+            where: {
+                id: plan.id,
+            },
+            data: {
+                status: "MATURED",
+                expectedInterest,
+                totalPayout,
+                lastCompoundedAt: plan.maturityDate,
+            },
+        });
+        //invalidate redis cache
+        await  redisClient.del(`singleSavings:${userId}`);
     }
 
-    if (plan.status !== "matured") {
+    if (plan.status !== "MATURED") {
         return res.status(200).json({
             success: true,
             data: {
@@ -119,9 +153,42 @@ export const getMySavingsHistory = asyncHandler(async (req, res) => {
         });
     }
 
-    const savingsHistory = await SingleSavings.find({
-        user: userId,
-    }).sort({ createdAt: -1 });
+    // create a unique cache key for this user
+    const cacheKey = `singleSavings:${userId}`;
+
+    //1 check redis first
+    const cachedHistory = await redisClient.get(cacheKey);
+
+    if (cachedHistory) {
+        console.log("Savings history served from redis");
+        const savingsHistory = JSON.parse(cachedHistory);
+
+        return res.status(200).json({
+            success: true,
+            count: savingsHistory.length,
+            data: savingsHistory,
+        });
+    }
+    console.log("savings history fetched from postgreSQL");
+
+    //2 if not in redis, fetch from postgreSQL
+    const savingsHistory = await prisma.singleSavings.findMany({
+        where: {
+            userId,
+        },
+        orderBy: {
+            createdAt: "desc",
+        },
+    });
+
+    //3 save the result in redis for 5 minutes
+    await redisClient.set(
+        cacheKey,
+        JSON.stringify(savingsHistory),
+        {
+            EX: 300, //5 minutes
+        }
+    );
 
     res.status(200).json({
         success: true,
@@ -130,96 +197,18 @@ export const getMySavingsHistory = asyncHandler(async (req, res) => {
     });
 });
 
-/*export const withdrawSingleSavings = asyncHandler(async (req, res) => {
-    const { planId } = req.params;
-    const { amount } = req.body;
-
-    const userId = req.user?.id || req.user?._id;
-
-
-    const plan = await SingleSavings.findOne({
-        _id: planId,
-        user: userId,
-    });
-
-    if (!plan) {
-        return res.status(404).json({
-            success: false,
-            message: "Savings plan not found",
-        });
-    }
-
-    if (!amount || amount <= 0) {
-        return res.status(400).json({
-            success: false,
-            message: "Invalid withdrawal amount",
-        });
-    }
-
-    // Not matured yet
-    if (plan.status !== "matured") {
-        if (amount > plan.amountSaved) {
-            return res.status(400).json({
-                success: false,
-                message:
-                    "Withdrawal amount cannot exceed amount saved",
-            });
-        }
-
-        plan.amountSaved -= amount;
-
-        // Recalculate interest and payout
-        plan.expectedInterest =
-            (plan.amountSaved * plan.interestRate) / 100;
-
-        plan.totalPayout =
-            plan.amountSaved + plan.expectedInterest;
-
-        await plan.save();
-
-        return res.status(200).json({
-            success: true,
-            message: "Withdrawal successful",
-            withdrawn: amount,
-            remainingBalance: plan.amountSaved,
-        });
-    }
-
-    // Matured
-    if (amount > plan.totalPayout) {
-        return res.status(400).json({
-            success: false,
-            message:
-                "Withdrawal amount cannot exceed available payout",
-        });
-    }
-
-    plan.totalPayout -= amount;
-
-    await plan.save();
-
-    if (plan.totalPayout <= 0) {
-        plan.status = "withdrawn";
-        await plan.save();
-    }
-
-    return res.status(200).json({
-        success: true,
-        message: "Withdrawal successful",
-        withdrawn: amount,
-        remainingBalance: plan.totalPayout,
-    });
-});*/
 
 export const withdrawSingleSavings = asyncHandler(async (req, res) => {
     const { planId } = req.params;
-    const { amount } = req.body;
+    const { amount, WalletType, walletAddress } = req.body;
 
     const userId = req.user?.id || req.user?._id;
 
-    const plan = await SingleSavings.findOne({
-        _id: planId,
-        user: userId,
+    const plan = await prisma.singleSavings.findFirst({
+        where: {
+            id: planId,
+            userId,
+        },
     });
 
     if (!plan) {
@@ -235,9 +224,26 @@ export const withdrawSingleSavings = asyncHandler(async (req, res) => {
             message: "Invalid withdrawal amount",
         });
     }
+    if (
+    !WalletType || 
+    !["BITCOIN", "ETHEREUM"].includes(WalletType)
+  ) {
+    return res.status(400).json({
+      success: false,
+      message:
+      "Wallet type must be BITCOIN or ETHEREUM",
+    });
+  }
+
+  if (!walletAddress) {
+    return res.status(400).json({
+      success: false,
+      message: "wallet address is required",
+    });
+  }
 
     // NOT MATURED
-    if (plan.status !== "matured") {
+    if (plan.status !== "MATURED") {
         if (amount > plan.amountSaved) {
             return res.status(400).json({
                 success: false,
@@ -245,27 +251,44 @@ export const withdrawSingleSavings = asyncHandler(async (req, res) => {
             });
         }
 
-        plan.amountSaved -= amount;
+        const newAmountSaved =
+        plan.amountSaved - amount;
 
-        plan.expectedInterest =
-            (plan.amountSaved * plan.interestRate) / 100;
+        const newInterest = 
+        (newAmountSaved * plan.interestRate) / 100;
 
-        plan.totalPayout =
-            plan.amountSaved + plan.expectedInterest;
+        const newTotalPayout = 
+        newAmountSaved + newInterest;
 
-        await plan.save();
+        await prisma.singleSavings.update({
+            where: {
+                id: plan.id,
+            },
+            data: {
+                amountSaved: newAmountSaved,
+                expectedInterest: newInterest,
+                totalPayout: newTotalPayout,
+            },
+        });
 
         // Save withdrawal history
-        await SingleSavingsWithdrawal.create({
-            user: userId,
-            savingsPlan: plan._id,
-            amount,
+        await prisma.singleSavingsWithdrawal.create({
+            data: {
+                userId,
+                savingsPlanId: plan.id,
+                amount,
+                WalletType,
+                walletAddress
+            },
         });
+        await redisClient.del(`singleSavings:${userId}`);
 
         return res.status(200).json({
             success: true,
-            message: "Withdrawal successful",
+            message: "Withdrawal successful, awaiting approval",
             withdrawn: amount,
+            walletType: WalletType,
+            walletAddress: walletAddress,
             remainingBalance: plan.amountSaved,
         });
     }
@@ -278,40 +301,60 @@ export const withdrawSingleSavings = asyncHandler(async (req, res) => {
         });
     }
 
-    plan.totalPayout -= amount;
+    const remainingBalance =
+    plan.totalPayout - amount;
 
-    if (plan.totalPayout <= 0) {
-        plan.status = "withdrawn";
-    }
-
-    await plan.save();
+    await prisma.singleSavings.update({
+        where: {
+            id: plan.id,
+        },
+        data: {
+            totalPayout: remainingBalance,
+            ...(remainingBalance <= 0 && {
+                status: "WITHDRAWN",
+            }),
+        },
+    });
 
     // Save withdrawal history
-    await SingleSavingsWithdrawal.create({
-        user: userId,
-        savingsPlan: plan._id,
-        amount,
+    await prisma.singleSavingsWithdrawal.create({
+        data: {
+            userId,
+            savingsPlanId: plan.id,
+            amount,
+        },
     });
+    await redisClient.del(`singleSavings:${userId}`);
 
     return res.status(200).json({
         success: true,
         message: "Withdrawal successful",
         withdrawn: amount,
-        remainingBalance: plan.totalPayout,
+        remainingBalance,
     });
 });
 
 export const getSingleSavingsWithdrawalHistory = asyncHandler(async (req, res) => {
     const userId = req.user?.id || req.user?._id;
 
-    const withdrawals = await SingleSavingsWithdrawal.find({
-        user: userId,
-    })
-        .populate(
-            "savingsPlan",
-            "amountSaved totalPayout status"
-        )
-        .sort({ createdAt: -1 });
+    const withdrawals =
+    await prisma.singleSavingsWithdrawal.findMany({
+        where: {
+            userId,
+        },
+        include: {
+            savingsPlan: {
+                select: {
+                    amountSaved: true,
+                    totalPayout: true,
+                    status: true,
+                },
+            },
+        },
+        orderBy: {
+            createdAt: "desc",
+        },
+    });
 
     res.status(200).json({
         success: true,

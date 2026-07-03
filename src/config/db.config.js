@@ -1,35 +1,15 @@
-import mongoose from 'mongoose';
-import config from './app.config.js'
+import {prisma} from "./db.prisma.js";
 
-export const connectToDatabase = () => 
-{
-    let mongoUri;
-    switch (config.environment)
-    {
-        case 'development':
-            mongoUri = config.db.development;
-            break;
-        case 'test':
-            mongoUri = config.db.test;
-            break;
-        case 'production':
-            mongoUri = config.db.production;
-            break;
-        default:
-            mongoUri = config.db.development;
-            break;
+export const connectToDatabase = async() => {
+    try{
+        await prisma.$connect();
+        console.log("Connected to PostgreSQL database");
+    
+    } catch (error) {
+        console.error("Database connection error.", error);
+        process.exit(1);
     }
-    console.log(mongoUri)
-
-    mongoose.connect(mongoUri);
-    mongoose.connection.on('open', () => 
-    {
-        console.log('connected to mongodb database instanse');
-    })
-    mongoose.connection.on('error', () => 
-    {
-        console.error.bind(console, 'mongodb connection error');
-
-    })
-
-}
+};
+export const disconnectDatabase = async () => {
+    await prisma.$disconnect();
+};

@@ -1,7 +1,9 @@
 import {Router} from 'express';
 import authMiddleware from '../../app/middleware/auth.middleware.js';
 import {userlimiter} from './userlimiter.js';
-import { createUserAccount, verifyEmailOTP, authenticateUser, deleteUserAccount, getAuthenticatedUser, logoutUser, updateUserAccount, forgotPassword, resetPassword } from './auth.controller.js';
+import { createUserAccount, verifyEmailOTP, authenticateUser, deleteUserAccount,
+     getAuthenticatedUser, logoutUser, updateUserAccount, forgotPassword, resetPassword,
+      reportProblem, getMyReports } from './auth.controller.js';
 const router = Router();
 
 router.post('/register', createUserAccount);
@@ -12,6 +14,8 @@ router.delete('/delete/:userId', authMiddleware, deleteUserAccount);
 router.put('/users/:userId', authMiddleware, updateUserAccount);
 router.post('/forgot-password', forgotPassword);
 router.post('/reset-password', resetPassword);
+router.post('/report-Problem', authMiddleware, reportProblem);
+router.get('/get-My-Reports', authMiddleware, getMyReports);
 router.post("/logout", logoutUser);
 
 
